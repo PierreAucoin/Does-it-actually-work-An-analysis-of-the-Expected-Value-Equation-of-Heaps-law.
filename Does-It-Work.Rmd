@@ -1,0 +1,558 @@
+---
+title: Does it actually work? An analysis of the Expected Value Equation of Heaps'
+  law.
+author: "Pierre Aucoin"
+date: 'Last Generated: `r Sys.time()` ADT'
+output:
+  html_document:
+    df_print: paged
+subtitle: Heaps law minimum sample size estimation
+urlcolor: blue
+---
+```{r setup, include = FALSE}
+# Specify global settings
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+# Start fresh by clearing R environment
+rm(list = ls())
+
+# Load required libraries here
+library(tidyverse)
+library(RColorBrewer) # for generating color scheme
+library(scales) # for generating color scheme
+library(magicaxis)
+
+# Text processing
+library(tidytext)
+library(textclean)
+library(tokenizers)
+
+# Benckmarking
+library(rbenchmark)
+
+# Color scheme
+hex <- hue_pal()(3)
+gg_red <- hex[1]
+gg_green <- hex[2]
+gg_blue <- hex[3]
+gg_orange <- brewer.pal(n = 11, name = "PuOr")[4]
+gg_purple <- "#C77CFF"
+```
+
+
+# PubMed Abstract Plot
+
+```{r,echo=FALSE}
+# Load the data.
+raw_data <- read_csv("PubMed-Mimic-Gpt-Neo-10000.csv")
+# Start with the PubMed data
+raw_abstracts <- raw_data$pubmed
+```
+
+```{r,echo=FALSE}
+# Limit to the first 250 documents.
+d <- 250
+abstracts <- vector("list", length = d)
+
+for (j in 1 : d) {
+  raw_abstract <- raw_abstracts[j]
+  abstract_clean <- raw_abstract %>%
+    tolower() %>% # convert sentences to lowercase
+    replace_contraction()  %>%  # expand contraction
+    replace_white %>%  # replace double white space into single space
+    str_remove_all(pattern = "[0-9]") %>% # remove numbers
+    str_remove_all(pattern = "[()]") %>% # remove specific punctuation
+    str_remove_all(pattern = "--") %>%
+    str_replace_all(pattern = " - ", replacement = "-")  # replace pattern
+
+  # Split words from sentences
+  abstract_tokenized <- abstract_clean %>% 
+    strsplit(" ") %>% 
+    unlist() %>%
+    str_remove_all(pattern = "^“") %>% # remove leading double quotes
+    str_remove_all(pattern = "”$") %>% # remove trailing double quotes
+    str_remove_all(pattern = "\\.$") %>% # remove trailing periods
+    str_remove_all(pattern = ";$") %>% # remove trailing semicolons
+    str_remove_all(pattern = "^_") %>% # remove leading underscores
+    str_remove_all(pattern = "_$") %>% # remove trailing underscores
+    str_remove_all(pattern = "^,") %>% # remove leading commas
+    str_remove_all(pattern = ",$") %>% # remove trailing commas
+    str_remove_all(pattern = "!$") %>% # remove trailing exclamation points
+    str_remove_all(pattern = "\\?$") # remove trailing question marks
+  
+  # Drop any empty words (i.e., "" entries)
+  abstracts[[j]] <- abstract_tokenized[nzchar(abstract_tokenized)]
+}
+
+# Print sample to console
+#cat("\nTokenized abstract #1:\n")
+#abstracts[[1]]
+```
+
+
+
+```{r,echo=FALSE}
+# Calculate expected vocab size
+EV_calc <- function(d, n, Ni, V) {
+  EV <- numeric(d)
+
+  for (j in 1 : d) {
+    EV[j] <- V[d] - sum(dhyper(x = 0, m = Ni[[d]], n = n[d] - Ni[[d]], k = n[j]))
+  }
+  
+  return(EV)
+}
+```
+
+
+```{r,echo=FALSE}
+# Calculate variance of vocab size
+VV_calc <- function(d, n, Ni, V) {
+  VV <- numeric(d)
+
+  # Store r,s combinations in matrix form
+  X <- matrix(data = rep(0, V[d] ^ 2), nrow = V[d], ncol = V[d])
+
+  for (r in 2 : V[d]) {
+    for (s in 1 : (r - 1)) {
+      X[r, s] <- Ni[[d]][r] + Ni[[d]][s]
+    }
+  }
+
+  # Do the calculation
+  for (j in 1 : d) {
+    #if(j %% 10 == 0) {print(j)}
+    XX <-  dhyper(x = 0, m = X, n = n[d] - X, k = n[j])
+    A <- dhyper(x = 0, m = Ni[[d]], n = n[d] - Ni[[d]], k = n[j])
+    S1 <- 0
+    for (r in 1 : V[d]) {
+      S1 <- S1 + A[r] * (1 - A[r])
+    }
+  
+    S2 <- 0
+    for (r in 2 : V[d]) {
+      for (s  in 1 : (r - 1)) {
+        S2 <- S2 + (XX[r, s] - A[r] * A[s])
+      }
+    }
+  
+    VV[j] <- S1 + 2 * S2
+  }
+  
+  return(VV)
+}
+```
+
+
+```{r,echo=FALSE}
+# Binomial approximated expected vocab size
+EV_approx_calc <- function(d, n, Ni, V) {
+  EV_approx <- numeric(d)
+
+  for (j in 1 : d) {
+    EV_approx[j] <- V[d] - sum((1 - Ni[[d]] / n[d]) ^ n[j])
+  }
+  
+  return(EV_approx)
+}
+```
+
+
+```{r,echo=FALSE}
+# Binomial approximated vocab size variance
+VV_approx_calc <- function(d, n, Ni, V) {
+  VV_approx <- numeric(d)
+  theta <- Ni[[d]] / n[d]
+  phi <- 1 - theta
+  
+  for (j in 1 : d) {
+    #if (j %% 25 == 0) {print(j)}
+  
+    S1 <- 0
+    for (r in 1 : V[d]) {
+      S1 <- S1 + (1 - theta[r] ^ n[j]) * (1 - (1 - theta[r]) ^ n[j])
+    }
+  
+    S2 <- 0
+    for (r in 2 : V[d]) {
+      for (s in 1 : (r - 1)) {
+        S2 <- S2 + (1 - theta[r] - theta[s]) ^ n[j] - (1 - theta[r]) ^ n[j] * (1 - theta[s]) ^ n[j]
+      }
+    }
+  
+    VV_approx[j] <- S1 + 2 * S2
+  }
+  
+  return(VV_approx)
+}
+```
+
+
+```{r,echo=FALSE}
+# Calculate basic stats
+d <- 250
+V <- numeric(d)
+n <- numeric(d)
+N <- length(unlist(abstracts))
+Ni <- vector("list", length = d) 
+
+# Initialize
+meta_doc <- abstracts[[1]]
+n[1] <- length(meta_doc)
+V[1] <- length(unique(meta_doc))
+Ni[[1]] <- as.numeric(sort(table(meta_doc), decreasing = TRUE))
+
+# Build the statistics
+for (j in 2 : d) {
+  meta_doc <- c(meta_doc, abstracts[[j]])
+  n[j] <- length(meta_doc)
+  V[j] <- length(unique(meta_doc))
+  Ni[[j]] <- as.numeric(sort(table(meta_doc), decreasing = TRUE))
+}
+```
+
+
+```{r,echo=FALSE}
+# Calculate expected values and variances
+EV <- EV_calc(d, n, Ni, V)
+VV <- VV_calc(d, n, Ni, V)
+EV_approx <- EV_approx_calc(d, n, Ni, V)
+VV_approx <- VV_approx_calc(d, n, Ni, V)
+```
+
+
+
+```{r,echo=FALSE,fig.cap = "Figure 1, Graph of the expected value equations and the actual data for 250 PubMed Abstracts",fig.align = "center", fig.width=16/2, fig.height=9/2}
+plot(x = n,
+    y = V,
+    main = "PubMed Abstracts",
+    xlab = "total terms",
+    ylab = "distinct terms",
+    axes = FALSE,
+    col=gg_orange,
+    type = "l",
+    lwd = 2)
+  grid(lwd = 2)
+  magaxis()
+  points(x = n, y = EV, type = "l", lwd = 2, col = gg_red)
+  points(x = n, y = EV + 2 * sqrt(VV), type = "l", lty = "dashed", lwd = 1, col = gg_red)
+  points(x = n, y = EV - 2 * sqrt(VV), type = "l", lty = "dashed", lwd = 1, col = gg_red)
+  points(x = n, y = EV_approx, type = "l", lwd = 2, col = gg_blue)
+  points(x = n, y = EV_approx + 2 * sqrt(VV_approx), type = "l", lty = "dashed", lwd = 1, col = gg_blue)
+  points(x = n, y = EV_approx - 2 * sqrt(VV_approx), type = "l", lty = "dashed", lwd = 1, col = gg_blue)
+legend(x = "topleft",          # Position
+       legend = c("Actual Values", "Expected Value","Upper Expected Value Limit","Lower Expected Value Limit","Approximate Expected Values","Approximate Upper Expected Values limit","Approximate Lower Expected Values limit"),col=c(gg_orange,gg_red,gg_red,gg_red,gg_blue,gg_blue,gg_blue),lty=c(1,1,2,2,1,2,2),lwd=2,cex=.5)  # Legend texts
+```
+
+
+
+# GPT-Neo 125M Abstract Plot
+
+```{r,echo=FALSE}
+#Exact same thing as above, but this time for GPT-Neo abstracts with 125 million parameters.
+raw_abstracts_two <- raw_data$`pubmed-gpt-neo-125m`
+```
+
+
+```{r,echo=FALSE}
+# Limit ourselves to the first d abstracts
+d <- 250
+abstracts_two <- vector("list", length = d)
+
+for (j in 1 : d) {
+  raw_abstract <- raw_abstracts_two[j]
+  abstract_clean <- raw_abstract %>%
+    tolower() %>% # convert sentences to lowercase
+    replace_contraction()  %>%  # expand contraction
+    replace_white %>%  # replace double white space into single space
+    str_remove_all(pattern = "[0-9]") %>% # remove numbers
+    str_remove_all(pattern = "[()]") %>% # remove specific punctuation
+    str_remove_all(pattern = "--") %>%
+    str_replace_all(pattern = " - ", replacement = "-")  # replace pattern
+
+  # Split words from sentences
+  abstract_tokenized <- abstract_clean %>% 
+    strsplit(" ") %>% 
+    unlist() %>%
+    str_remove_all(pattern = "^“") %>% # remove leading double quotes
+    str_remove_all(pattern = "”$") %>% # remove trailing double quotes
+    str_remove_all(pattern = "\\.$") %>% # remove trailing periods
+    str_remove_all(pattern = ";$") %>% # remove trailing semicolons
+    str_remove_all(pattern = "^_") %>% # remove leading underscores
+    str_remove_all(pattern = "_$") %>% # remove trailing underscores
+    str_remove_all(pattern = "^,") %>% # remove leading commas
+    str_remove_all(pattern = ",$") %>% # remove trailing commas
+    str_remove_all(pattern = "!$") %>% # remove trailing exclamation points
+    str_remove_all(pattern = "\\?$") # remove trailing question marks
+  
+  # Drop any empty words (i.e., "" entries)
+  abstracts_two[[j]] <- abstract_tokenized[nzchar(abstract_tokenized)]
+}
+
+# Print sample to console
+#cat("\nTokenized abstract #1:\n")
+#abstracts[[1]]
+```
+
+
+
+```{r,echo=FALSE}
+# Calculate basic stats
+d_two <- 250
+V_two <- numeric(d_two)
+n_two <- numeric(d_two)
+N_two <- length(unlist(abstracts_two))
+Ni_two <- vector("list", length = d) 
+
+# Initialize
+meta_doc <- abstracts_two[[1]]
+n_two[1] <- length(meta_doc)
+V_two[1] <- length(unique(meta_doc))
+Ni_two[[1]] <- as.numeric(sort(table(meta_doc), decreasing = TRUE))
+
+# Build the statistics
+for (j in 2 : d) {
+  meta_doc <- c(meta_doc, abstracts_two[[j]])
+  n_two[j] <- length(meta_doc)
+  V_two[j] <- length(unique(meta_doc))
+  Ni_two[[j]] <- as.numeric(sort(table(meta_doc), decreasing = TRUE))
+}
+```
+
+
+```{r,echo=FALSE}
+# Calculate expected values and variances
+EV_two <- EV_calc(d_two, n_two, Ni_two, V_two)
+VV_two <- VV_calc(d_two, n_two, Ni_two, V_two)
+EV_two_approx <- EV_approx_calc(d_two, n_two, Ni_two, V_two)
+VV_two_approx <- VV_approx_calc(d_two, n_two, Ni_two, V_two)
+```
+
+
+```{r,echo=FALSE,fig.cap = "Figure 2: Graph of the expected value equations and the actual data for 250 Abstracts created by GPT-Neo with 125 million parameters",fig.align = "center", fig.width=16/2, fig.height=9/2}
+# Plot Heaps' law (empirical) with expected value and standard deviation curves
+plot(x = n_two,
+    y = V_two,
+    main = "GPT_NEO 125m Abstracts",
+    xlab = "total terms",
+    ylab = "distinct terms",
+    axes = FALSE,
+    col=gg_orange,
+    type = "l",
+    lwd = 2)
+  grid(lwd = 2)
+  magaxis()
+  points(x = n_two, y = EV_two, type = "l", lwd = 2, col = gg_red)
+  points(x = n_two, y = EV_two + 2 * sqrt(VV_two), type = "l", lty = "dashed", lwd = 1, col = gg_red)
+  points(x = n_two, y = EV_two - 2 * sqrt(V_two), type = "l", lty = "dashed", lwd = 1, col = gg_red)
+  points(x = n_two, y = EV_two_approx, type = "l", lwd = 2, col = gg_blue)
+  points(x = n_two, y = EV_two_approx + 2 * sqrt(VV_two_approx), type = "l", lty = "dashed", lwd = 1, col = gg_blue)
+  points(x = n_two, y = EV_two_approx - 2 * sqrt(VV_two_approx), type = "l", lty = "dashed", lwd = 1, col = gg_blue)
+legend(x = "topleft",          # Position
+       legend = c("Actual Values", "Expected Value","Upper Expected Value Limit","Lower Expected Value Limit","Approximate Expected Values","Approximate Upper Expected Values limit","Approximate Lower Expected Values limit"),col=c(gg_orange,gg_red,gg_red,gg_red,gg_blue,gg_blue,gg_blue),lty=c(1,1,2,2,1,2,2),lwd=2,cex=.5)  # Legend texts
+```
+
+
+# GPT-Neo 1.3B Abstract Plot
+```{r,echo=FALSE}
+raw_abstracts_three <- raw_data$`pubmed-gpt-neo-1.3b`
+```
+
+
+```{r,echo=FALSE}
+# Limit ourselves to the first d abstracts
+d <- 250
+abstracts_three <- vector("list", length = d)
+
+for (j in 1 : d) {
+  raw_abstract <- raw_abstracts_three[j]
+  abstract_clean <- raw_abstract %>%
+    tolower() %>% # convert sentences to lowercase
+    replace_contraction()  %>%  # expand contraction
+    replace_white %>%  # replace double white space into single space
+    str_remove_all(pattern = "[0-9]") %>% # remove numbers
+    str_remove_all(pattern = "[()]") %>% # remove specific punctuation
+    str_remove_all(pattern = "--") %>%
+    str_replace_all(pattern = " - ", replacement = "-")  # replace pattern
+
+  # Split words from sentences
+  abstract_tokenized <- abstract_clean %>% 
+    strsplit(" ") %>% 
+    unlist() %>%
+    str_remove_all(pattern = "^“") %>% # remove leading double quotes
+    str_remove_all(pattern = "”$") %>% # remove trailing double quotes
+    str_remove_all(pattern = "\\.$") %>% # remove trailing periods
+    str_remove_all(pattern = ";$") %>% # remove trailing semicolons
+    str_remove_all(pattern = "^_") %>% # remove leading underscores
+    str_remove_all(pattern = "_$") %>% # remove trailing underscores
+    str_remove_all(pattern = "^,") %>% # remove leading commas
+    str_remove_all(pattern = ",$") %>% # remove trailing commas
+    str_remove_all(pattern = "!$") %>% # remove trailing exclamation points
+    str_remove_all(pattern = "\\?$") # remove trailing question marks
+  
+  # Drop any empty words (i.e., "" entries)
+  abstracts_three[[j]] <- abstract_tokenized[nzchar(abstract_tokenized)]
+}
+
+# Print sample to console
+#cat("\nTokenized abstract #1:\n")
+#abstracts[[1]]
+```
+
+
+```{r,echo=FALSE}
+# Calculate basic stats
+d_three <- 250
+V_three <- numeric(d_three)
+n_three <- numeric(d_three)
+N_three <- length(unlist(abstracts_three))
+Ni_three <- vector("list", length = d) 
+
+# Initialize
+meta_doc <- abstracts_three[[1]]
+n_three[1] <- length(meta_doc)
+V_three[1] <- length(unique(meta_doc))
+Ni_three[[1]] <- as.numeric(sort(table(meta_doc), decreasing = TRUE))
+
+# Build the statistics
+for (j in 2 : d) {
+  meta_doc <- c(meta_doc, abstracts_three[[j]])
+  n_three[j] <- length(meta_doc)
+  V_three[j] <- length(unique(meta_doc))
+  Ni_three[[j]] <- as.numeric(sort(table(meta_doc), decreasing = TRUE))
+}
+```
+
+
+```{r,echo=FALSE}
+# Calculate expected values and variances
+EV_three <- EV_calc(d_three, n_three, Ni_three, V_three)
+VV_three <- VV_calc(d_three, n_three, Ni_three, V_three)
+EV_three_approx <- EV_approx_calc(d_three, n_three, Ni_three, V_three)
+VV_three_approx <- VV_approx_calc(d_three, n_three, Ni_three, V_three)
+```
+
+
+```{r,echo=FALSE,fig.cap = "Figure 3, Graphing the expected value equations and the actual datafor 250 Abstracts created by GPT-Neo with 1.3 billion parameters",fig.align = "center", fig.width=16/2, fig.height=9/2}
+# Plot Heaps' law (empirical) with expected value and standard deviation curves
+plot(x = n_three,
+    y = V_three,
+    main = "GPT_NEO 1.3b Abstracts",
+    xlab = "total terms",
+    ylab = "distinct terms",
+    axes = FALSE,
+    col=gg_orange,
+    type = "l",
+    lwd = 2)
+  grid(lwd = 2)
+  magaxis()
+  points(x = n_three, y = EV_three, type = "l", lwd = 2, col = gg_red)
+  points(x = n_three, y = EV_three + 2 * sqrt(VV), type = "l", lty = "dashed", lwd = 1, col = gg_red)
+  points(x = n_three, y = EV_three - 2 * sqrt(VV_three), type = "l", lty = "dashed", lwd = 1, col = gg_red)
+  points(x = n_three, y = EV_three_approx, type = "l", lwd = 2, col = gg_blue)
+  points(x = n_three, y = EV_three_approx + 2 * sqrt(VV_three_approx), type = "l", lty = "dashed", lwd = 1, col = gg_blue)
+  points(x = n_three, y = EV_three_approx - 2 * sqrt(VV_three_approx), type = "l", lty = "dashed", lwd = 1, col = gg_blue)
+legend(x = "topleft",          # Position
+       legend = c("Actual Values", "Expected Value","Upper Expected Value Limit","Lower Expected Value Limit","Approximate Expected Values","Approximate Upper Expected Values limit","Approximate Lower Expected Values limit"),col=c(gg_orange,gg_red,gg_red,gg_red,gg_blue,gg_blue,gg_blue),lty=c(1,1,2,2,1,2,2),lwd=2,cex=.5)  # Legend texts
+```
+
+
+# GPT-Neo 2.7B Abstract Plot
+```{r,echo=FALSE}
+raw_abstracts_four <- raw_data$`pubmed-gpt-neo-2.7`
+```
+```{r,echo=FALSE}
+# Limit ourselves to the first d abstracts
+d <- 250
+abstracts_four <- vector("list", length = d)
+
+for (j in 1 : d) {
+  raw_abstract <- raw_abstracts_four[j]
+  abstract_clean <- raw_abstract %>%
+    tolower() %>% # convert sentences to lowercase
+    replace_contraction()  %>%  # expand contraction
+    replace_white %>%  # replace double white space into single space
+    str_remove_all(pattern = "[0-9]") %>% # remove numbers
+    str_remove_all(pattern = "[()]") %>% # remove specific punctuation
+    str_remove_all(pattern = "--") %>%
+    str_replace_all(pattern = " - ", replacement = "-")  # replace pattern
+
+  # Split words from sentences
+  abstract_tokenized <- abstract_clean %>% 
+    strsplit(" ") %>% 
+    unlist() %>%
+    str_remove_all(pattern = "^“") %>% # remove leading double quotes
+    str_remove_all(pattern = "”$") %>% # remove trailing double quotes
+    str_remove_all(pattern = "\\.$") %>% # remove trailing periods
+    str_remove_all(pattern = ";$") %>% # remove trailing semicolons
+    str_remove_all(pattern = "^_") %>% # remove leading underscores
+    str_remove_all(pattern = "_$") %>% # remove trailing underscores
+    str_remove_all(pattern = "^,") %>% # remove leading commas
+    str_remove_all(pattern = ",$") %>% # remove trailing commas
+    str_remove_all(pattern = "!$") %>% # remove trailing exclamation points
+    str_remove_all(pattern = "\\?$") # remove trailing question marks
+  
+  # Drop any empty words (i.e., "" entries)
+  abstracts_four[[j]] <- abstract_tokenized[nzchar(abstract_tokenized)]
+}
+
+# Print sample to console
+#cat("\nTokenized abstract #1:\n")
+#abstracts[[1]]
+```
+
+```{r,echo=FALSE}
+# Calculate basic stats
+d_four <- 250
+V_four <- numeric(d)
+n_four <- numeric(d)
+N_four <- length(unlist(abstracts))
+Ni_four <- vector("list", length = d) 
+
+# Initialize
+meta_doc <- abstracts_four[[1]]
+n_four[1] <- length(meta_doc)
+V_four[1] <- length(unique(meta_doc))
+Ni_four[[1]] <- as.numeric(sort(table(meta_doc), decreasing = TRUE))
+
+# Build the statistics
+for (j in 2 : d) {
+  meta_doc <- c(meta_doc, abstracts_four[[j]])
+  n_four[j] <- length(meta_doc)
+  V_four[j] <- length(unique(meta_doc))
+  Ni_four[[j]] <- as.numeric(sort(table(meta_doc), decreasing = TRUE))
+}
+```
+
+```{r,echo=FALSE}
+# Calculate expected values and variances
+EV_four <- EV_calc(d_four, n_four, Ni_four, V_four)
+VV_four <- VV_calc(d_four, n_four, Ni_four, V_four)
+EV_four_approx <- EV_approx_calc(d_four, n_four, Ni_four, V_four)
+VV_four_approx <- VV_approx_calc(d_four, n_four, Ni_four, V_four)
+```
+
+
+```{r,echo=FALSE,fig.cap = "Figure 4, Graphing the expected value equations and the actual datafor 250 Abstracts created by GPT-Neo with 2.7 billion parameters",fig.align = "center", fig.width=16/2, fig.height=9/2}
+# Plot Heaps' law (empirical) with expected value and standard deviation curves
+plot(x = n_four,
+    y = V_four,
+    main = "GPT_NEO 2.7b Abstracts",
+    xlab = "total terms",
+    ylab = "distinct terms",
+    axes = FALSE,
+    col=gg_orange,
+    type = "l",
+    lwd = 2)
+  grid(lwd = 2)
+  magaxis()
+  points(x = n_four, y = EV_four, type = "l", lwd = 2, col = gg_red)
+  points(x = n_four, y = EV_four + 2 * sqrt(VV), type = "l", lty = "dashed", lwd = 1, col = gg_red)
+  points(x = n_four, y = EV_four - 2 * sqrt(VV_four), type = "l", lty = "dashed", lwd = 1, col = gg_red)
+  points(x = n_four, y = EV_four_approx, type = "l", lwd = 2, col = gg_blue)
+  points(x = n_four, y = EV_four_approx + 2 * sqrt(VV_four_approx), type = "l", lty = "dashed", lwd = 1, col = gg_blue)
+  points(x = n_four, y = EV_four_approx - 2 * sqrt(VV_four_approx), type = "l", lty = "dashed", lwd = 1, col = gg_blue)
+legend(x = "topleft",          # Position
+       legend = c("Actual Values", "Expected Value","Upper Expected Value Limit","Lower Expected Value Limit","Approximate Expected Values","Approximate Upper Expected Values limit","Approximate Lower Expected Values limit"),col=c(gg_orange,gg_red,gg_red,gg_red,gg_blue,gg_blue,gg_blue),lty=c(1,1,2,2,1,2,2),lwd=2,cex=.5)  # Legend texts
+```
+
